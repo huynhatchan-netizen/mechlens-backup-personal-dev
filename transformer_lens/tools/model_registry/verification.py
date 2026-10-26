@@ -4,9 +4,25 @@ This module provides dataclasses and utilities for tracking which models
 have been verified to work with TransformerLens.
 """
 
+import json
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Optional
+
+
+def _preserve_loaded_fields(original: Optional[dict], initial: dict, current: dict) -> dict:
+    """Keep loaded JSON values unless a dataclass field has changed."""
+    if original is None:
+        return current
+    result = deepcopy(original)
+    for key in current.keys() | initial.keys():
+        # JSON comparison distinguishes bool/int and detects nested record edits.
+        if json.dumps(current.get(key), sort_keys=True) != json.dumps(
+            initial.get(key), sort_keys=True
+        ):
+            result[key] = current.get(key)
+    return result
 
 
 @dataclass
@@ -34,6 +50,8 @@ class VerificationRecord:
     invalidated: bool = False
     invalidation_reason: Optional[str] = None
     status: Optional[int] = None
+    _original: Optional[dict] = field(default=None, init=False, repr=False, compare=False)
+    _initial: dict = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def to_dict(self) -> dict:
         """Convert to a JSON-serializable dictionary."""
@@ -49,12 +67,12 @@ class VerificationRecord:
         }
         if self.status is not None:
             data["status"] = self.status
-        return data
+        return _preserve_loaded_fields(self._original, self._initial, data)
 
     @classmethod
     def from_dict(cls, data: dict) -> "VerificationRecord":
         """Create from a dictionary."""
-        return cls(
+        record = cls(
             model_id=data["model_id"],
             architecture_id=data.get("architecture_id", "Unknown"),
             verified_date=date.fromisoformat(data["verified_date"]),
@@ -65,6 +83,9 @@ class VerificationRecord:
             invalidation_reason=data.get("invalidation_reason"),
             status=data.get("status"),
         )
+        record._initial = record.to_dict()
+        record._original = deepcopy(data)
+        return record
 
 
 @dataclass
@@ -78,13 +99,16 @@ class VerificationHistory:
 
     records: list[VerificationRecord] = field(default_factory=list)
     last_updated: Optional[datetime] = None
+    _original: Optional[dict] = field(default=None, init=False, repr=False, compare=False)
+    _initial: dict = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def to_dict(self) -> dict:
         """Convert to a JSON-serializable dictionary."""
-        return {
+        current = {
             "last_updated": self.last_updated.isoformat() if self.last_updated else None,
             "records": [r.to_dict() for r in self.records],
         }
+        return _preserve_loaded_fields(self._original, self._initial, current)
 
     @classmethod
     def from_dict(cls, data: dict) -> "VerificationHistory":
@@ -92,10 +116,13 @@ class VerificationHistory:
         last_updated = None
         if data.get("last_updated"):
             last_updated = datetime.fromisoformat(data["last_updated"])
-        return cls(
+        history = cls(
             records=[VerificationRecord.from_dict(r) for r in data.get("records", [])],
             last_updated=last_updated,
         )
+        history._initial = history.to_dict()
+        history._original = deepcopy(data)
+        return history
 
     def get_record(self, model_id: str) -> Optional[VerificationRecord]:
         """Get the most recent valid verification record for a model.
@@ -126,7 +153,7 @@ class VerificationHistory:
                 continue
             if architecture_id is not None and record.architecture_id != architecture_id:
                 continue
-            return record.status == 1 and not record.invalidated
+            return type(record.status) is int and record.status == 1 and not record.invalidated
         return False
 
     def add_record(self, record: VerificationRecord) -> None:

@@ -128,3 +128,85 @@ class TestVerificationOutcomes(unittest.TestCase):
             }
             exec(compile(ast.Expression(call), "verify_models.py", "eval"), namespace)
             self.assertEqual(captured[0]["status"], expected)
+
+    def test_load_save_preserves_sparse_legacy_and_unknown_fields(self):
+        data = {
+            "custom_header": {"source": ["legacy", None]},
+            "last_updated": "2026-01-01T00:00:00Z",
+            "records": [
+                {
+                    "model_id": "legacy",
+                    "verified_date": "2026-01-01",
+                    "custom": {"scores": [1, None]},
+                },
+                {"model_id": "unknown", "verified_date": "2026-01-01", "status": None},
+                self.record(1).to_dict(),
+                self.record(3).to_dict(),
+            ],
+        }
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "history.json"
+            path.write_text(json.dumps(data))
+            with patch.object(registry_io, "_VERIFICATION_HISTORY_PATH", path):
+                history = registry_io.load_verification_history()
+                self.assertFalse(history.is_verified("legacy"))
+                self.assertFalse(history.is_verified("unknown"))
+                self.assertFalse(history.is_verified("model"))
+                registry_io.save_verification_history(history)
+                self.assertEqual(json.loads(path.read_text()), data)
+                self.assertFalse(registry_io.load_verification_history().is_verified("model"))
+
+    def test_round_trip_missing_history_fields(self):
+        for data in ({}, {"records": []}, {"last_updated": None}):
+            self.assertEqual(VerificationHistory.from_dict(data).to_dict(), data)
+
+    def test_loaded_record_mutations_survive_without_losing_extensions(self):
+        data = self.record(1).to_dict()
+        data["custom"] = {"keep": True}
+        history = VerificationHistory.from_dict({"records": [data]})
+        history.invalidate("model", "regression")
+        restored = VerificationHistory.from_dict(history.to_dict())
+        self.assertFalse(restored.is_verified("model"))
+        self.assertEqual(restored.to_dict()["records"][0]["custom"], {"keep": True})
+        self.assertEqual(restored.records[0].invalidation_reason, "regression")
+        restored.records[0].status = None
+        self.assertIsNone(VerificationHistory.from_dict(restored.to_dict()).records[0].status)
+
+    def test_malformed_numeric_status_is_not_success(self):
+        for value in (True, 1.0, "1"):
+            data = self.record().to_dict()
+            data["status"] = value
+            history = VerificationHistory.from_dict({"records": [data]})
+            self.assertFalse(history.is_verified("model"))
+
+    def test_actual_history_load_save_preserves_all_records(self):
+        original = registry_io._VERIFICATION_HISTORY_PATH.read_bytes()
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "history.json"
+            path.write_bytes(original)
+            with patch.object(registry_io, "_VERIFICATION_HISTORY_PATH", path):
+                history = registry_io.load_verification_history()
+                before = {r.model_id: history.is_verified(r.model_id) for r in history.records}
+                registry_io.save_verification_history(history)
+                restored = registry_io.load_verification_history()
+                self.assertEqual(json.loads(path.read_bytes()), json.loads(original))
+                self.assertEqual(
+                    {r.model_id: restored.is_verified(r.model_id) for r in restored.records}, before
+                )
+
+    def test_outcomes_and_architectures_survive_repeated_round_trips(self):
+        for status in (None, 0, 1, 2, 3):
+            for invalidated in (False, True):
+                latest = self.record(status, "A")
+                latest.invalidated = invalidated
+                history = VerificationHistory(
+                    [self.record(1, "A"), latest, self.record(1, "B")]
+                )
+                for _ in range(3):
+                    history = VerificationHistory.from_dict(
+                        json.loads(json.dumps(history.to_dict()))
+                    )
+                    self.assertEqual(
+                        history.is_verified("model", "A"), status == 1 and not invalidated
+                    )
+                    self.assertTrue(history.is_verified("model", "B"))
