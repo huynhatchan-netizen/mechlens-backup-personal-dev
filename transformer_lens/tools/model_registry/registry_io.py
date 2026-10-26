@@ -291,6 +291,9 @@ def add_verification_record(
     notes: Optional[str] = None,
     verified_by: str = "verify_models",
     sanitize_fn: Optional[Callable[[Optional[str]], Optional[str]]] = None,
+    *,
+    status: Optional[int] = STATUS_VERIFIED,
+    phase_scores: Optional[dict[int, Optional[float]]] = None,
 ) -> None:
     """Append a VerificationRecord to verification_history.json.
 
@@ -300,6 +303,8 @@ def add_verification_record(
     Args:
         model_id: The verified model
         arch_id: Architecture type
+        status: Explicit outcome, or None for a score-only run
+        phase_scores: Scores from this run
         notes: Optional verification notes
         verified_by: Who/what performed the verification
         sanitize_fn: Optional callable to sanitize note strings
@@ -314,6 +319,8 @@ def add_verification_record(
         verified_by=verified_by,
         transformerlens_version=_get_tl_version(),
         notes=notes,
+        status=status,
+        phase_scores=dict(phase_scores or {}),
     )
 
     history = load_verification_history()

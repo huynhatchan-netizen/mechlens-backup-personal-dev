@@ -729,6 +729,9 @@ def _skip_model(
         print(f"  SKIP: {note}")
     if _get_current_model_status(model_id, arch) != STATUS_VERIFIED:
         update_model_status(model_id, arch, STATUS_SKIPPED, note=note, sanitize_fn=_sanitize_note)
+        add_verification_record(
+            model_id, arch, notes=note, status=STATUS_SKIPPED, sanitize_fn=_sanitize_note
+        )
     elif not quiet:
         print("  (preserving existing verified status)")
     progress.skipped.append(model_id)
@@ -1066,6 +1069,13 @@ def verify_models(
                     phase_scores=filtered_scores,
                     note=partial_note,
                 )
+                add_verification_record(
+                    model_id,
+                    arch,
+                    notes=partial_note,
+                    status=partial_status,
+                    phase_scores=filtered_scores,
+                )
                 if partial_status == STATUS_FAILED:
                     progress.failed.append(model_id)
                 else:
@@ -1093,6 +1103,8 @@ def verify_models(
                 model_id,
                 arch,
                 notes=note,
+                status=STATUS_VERIFIED,
+                phase_scores=phase_scores,
             )
             progress.verified.append(model_id)
         else:
@@ -1117,6 +1129,8 @@ def verify_models(
                 model_id,
                 arch,
                 notes=note,
+                status=STATUS_FAILED,
+                phase_scores=phase_scores,
                 sanitize_fn=_sanitize_note,
             )
             progress.failed.append(model_id)
