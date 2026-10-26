@@ -38,7 +38,9 @@ class VerificationRecord:
         notes: Optional notes about the verification
         invalidated: Whether this verification has been invalidated
         invalidation_reason: Reason for invalidation if applicable
-        status: Explicit registry outcome (0-3), or None when unknown
+        status: Attempt outcome (0=partial/unverified, 1=verified, 2=skipped,
+            3=failed), or None when unknown; distinct from current registry status
+        phases: Requested phases, not a claim that every phase completed
     """
 
     model_id: str
@@ -50,6 +52,7 @@ class VerificationRecord:
     invalidated: bool = False
     invalidation_reason: Optional[str] = None
     status: Optional[int] = None
+    phases: Optional[list[int]] = None
     _original: Optional[dict] = field(default=None, init=False, repr=False, compare=False)
     _initial: dict = field(default_factory=dict, init=False, repr=False, compare=False)
 
@@ -67,6 +70,8 @@ class VerificationRecord:
         }
         if self.status is not None:
             data["status"] = self.status
+        if self.phases is not None:
+            data["phases"] = list(self.phases)
         return _preserve_loaded_fields(self._original, self._initial, data)
 
     @classmethod
@@ -82,6 +87,7 @@ class VerificationRecord:
             invalidated=data.get("invalidated", False),
             invalidation_reason=data.get("invalidation_reason"),
             status=data.get("status"),
+            phases=list(data["phases"]) if data.get("phases") is not None else None,
         )
         record._initial = record.to_dict()
         record._original = deepcopy(data)

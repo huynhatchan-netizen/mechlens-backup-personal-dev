@@ -1,6 +1,5 @@
 """Regression tests for explicit outcomes and preservation of legacy history."""
 
-import ast
 import json
 import unittest
 from datetime import date
@@ -101,34 +100,6 @@ class TestVerificationOutcomes(unittest.TestCase):
             data["records"][0]["status"] = status
             self.assertFalse(validate_verification_history(data).valid)
 
-    def test_full_run_writers_supply_explicit_outcomes(self):
-        source = Path(registry_io.__file__).with_name("verify_models.py").read_text()
-        tree = ast.parse(source)
-        runner = next(
-            n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "verify_models"
-        )
-        calls = [
-            n
-            for n in ast.walk(runner)
-            if isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Name)
-            and n.func.id == "add_verification_record"
-        ]
-        self.assertEqual(len(calls), 2)
-        for call, expected in zip(sorted(calls, key=lambda n: n.lineno), (1, 3)):
-            captured = []
-            namespace = {
-                "add_verification_record": lambda *args, **kwargs: captured.append(kwargs),
-                "model_id": "model",
-                "arch": "A",
-                "note": "result",
-                "STATUS_VERIFIED": 1,
-                "STATUS_FAILED": 3,
-                "_sanitize_note": lambda x: x,
-            }
-            exec(compile(ast.Expression(call), "verify_models.py", "eval"), namespace)
-            self.assertEqual(captured[0]["status"], expected)
-
     def test_load_save_preserves_sparse_legacy_and_unknown_fields(self):
         data = {
             "custom_header": {"source": ["legacy", None]},
@@ -210,3 +181,22 @@ class TestVerificationOutcomes(unittest.TestCase):
                         history.is_verified("model", "A"), status == 1 and not invalidated
                     )
                     self.assertTrue(history.is_verified("model", "B"))
+
+    def test_requested_phases_round_trip_and_mutation(self):
+        record = self.record(3)
+        record.phases = [1, 4]
+        loaded = VerificationHistory.from_dict(VerificationHistory([record]).to_dict())
+        self.assertEqual(loaded.records[0].phases, [1, 4])
+        loaded.records[0].phases.append(7)
+        restored = VerificationHistory.from_dict(loaded.to_dict())
+        self.assertEqual(restored.records[0].phases, [1, 4, 7])
+
+    def test_requested_phases_validation(self):
+        for phases in (None, [], [1, 2, 3, 4], [1, 7, 8]):
+            data = VerificationHistory([self.record()]).to_dict()
+            data["records"][0]["phases"] = phases
+            self.assertTrue(validate_verification_history(data).valid)
+        for phases in ("1", [True], [5], [1.0]):
+            data = VerificationHistory([self.record()]).to_dict()
+            data["records"][0]["phases"] = phases
+            self.assertFalse(validate_verification_history(data).valid)

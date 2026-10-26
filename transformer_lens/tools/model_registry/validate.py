@@ -398,6 +398,13 @@ def _validate_verification_record(data: dict, path: str) -> list[ValidationError
     if status is not None and (type(status) is not int or status not in (0, 1, 2, 3)):
         errors.append(ValidationError(f"{path}.status", "expected status 0-3 or null", status))
 
+    phases = data.get("phases")
+    if phases is not None and (
+        not isinstance(phases, list)
+        or any(type(phase) is not int or phase not in (1, 2, 3, 4, 7, 8) for phase in phases)
+    ):
+        errors.append(ValidationError(f"{path}.phases", "expected a list of phase numbers", phases))
+
     # invalidated (optional boolean, defaults to False)
     if "invalidated" in data:
         errors.extend(_validate_bool(data["invalidated"], f"{path}.invalidated", required=False))

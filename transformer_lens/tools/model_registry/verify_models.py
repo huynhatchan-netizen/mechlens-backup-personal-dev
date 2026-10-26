@@ -157,6 +157,7 @@ class VerificationProgress:
     failed: list[str] = field(default_factory=list)
     verified: list[str] = field(default_factory=list)
     start_time: Optional[str] = None
+    partial: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -165,6 +166,7 @@ class VerificationProgress:
             "failed": self.failed,
             "verified": self.verified,
             "start_time": self.start_time,
+            "partial": self.partial,
         }
 
     @classmethod
@@ -175,6 +177,7 @@ class VerificationProgress:
             failed=data.get("failed", []),
             verified=data.get("verified", []),
             start_time=data.get("start_time"),
+            partial=data.get("partial", []),
         )
 
 
@@ -720,7 +723,13 @@ def _save_checkpoint(progress: VerificationProgress) -> None:
 
 
 def _skip_model(
-    model_id: str, arch: str, note: str, progress: VerificationProgress, quiet: bool
+    model_id: str,
+    arch: str,
+    note: str,
+    progress: VerificationProgress,
+    quiet: bool,
+    *,
+    phases: Optional[list[int]] = None,
 ) -> None:
     """Record a model as skipped with ``note``, preserving an existing verified status, and
     checkpoint. Callers ``continue`` the loop afterwards.
@@ -731,6 +740,14 @@ def _skip_model(
         update_model_status(model_id, arch, STATUS_SKIPPED, note=note, sanitize_fn=_sanitize_note)
     elif not quiet:
         print("  (preserving existing verified status)")
+    add_verification_record(
+        model_id,
+        arch,
+        notes=note,
+        status=STATUS_SKIPPED,
+        phases=phases,
+        sanitize_fn=_sanitize_note,
+    )
     progress.skipped.append(model_id)
     _save_checkpoint(progress)
 
@@ -745,6 +762,87 @@ def _load_checkpoint() -> Optional[VerificationProgress]:
         return VerificationProgress.from_dict(data)
     except (json.JSONDecodeError, KeyError):
         return None
+
+
+def _record_verification_result(
+    model_id: str,
+    arch: str,
+    phases: list[int],
+    all_results: list,
+    error_msg: Optional[str],
+    progress: VerificationProgress,
+    quiet: bool,
+) -> None:
+    """Persist one completed benchmark attempt, including failures and partial runs.
+
+    The history status describes this attempt. A score-only partial run does
+    not replace the registry's overall status, even if this attempt failed.
+    Requested phases are retained so a core pass is distinguishable from a
+    full pass. Exceptions and failed correctness gates always take precedence.
+    """
+    phase_scores = _extract_phase_scores(all_results)
+    filtered_scores = {p: score for p, score in phase_scores.items() if p in phases}
+    kind = classify_architecture(arch)
+    if kind == "audio":
+        full_phases, core_required = {1, 8}, {1, 8}
+    elif kind == "multimodal":
+        full_phases, core_required = {1, 2, 3, 4, 7}, {1, 4, 7}
+    else:
+        full_phases, core_required = {1, 2, 3, 4}, {1, 4}
+    is_full = set(phases) == full_phases
+    is_core = set(phases) >= core_required
+
+    if error_msg is None:
+        error_msg = _check_phase_scores(phase_scores, all_results)
+    elif not error_msg:
+        error_msg = "Benchmark raised an exception without a message"
+    if error_msg is None and filtered_scores and is_core:
+        missing = sorted(p for p in core_required - {4} if filtered_scores.get(p) is None)
+        if missing:
+            error_msg = f"Missing required correctness results for phases {missing}"
+
+    if error_msg is not None:
+        status = STATUS_FAILED
+        if "out of memory" in error_msg.lower() or "oom" in error_msg.lower():
+            note = "OOM during benchmark"
+        else:
+            root_errors = [r.message for r in all_results if not r.passed and r.message]
+            detail = next(iter(dict.fromkeys(root_errors)), None)
+            note = f"{error_msg[:100]} — {detail[:150]}" if detail else error_msg[:200]
+    elif not filtered_scores:
+        status = STATUS_SKIPPED
+        note = f"No scored results for requested phases {phases}"
+    elif is_core:
+        status = STATUS_VERIFIED
+        note = _build_verified_note(filtered_scores, all_results)
+        if not is_full:
+            note = note.replace("Full verification", "Core verification", 1)
+    else:
+        status = STATUS_UNVERIFIED
+        note = f"Partial phases {phases} completed; overall verification not established"
+
+    if status != STATUS_SKIPPED and (filtered_scores or is_core):
+        update_model_status(
+            model_id,
+            arch,
+            status=status if is_core else None,
+            note=note if is_core else None,
+            phase_scores=filtered_scores,
+            sanitize_fn=_sanitize_note,
+        )
+    add_verification_record(
+        model_id, arch, notes=note, status=status, phases=phases, sanitize_fn=_sanitize_note
+    )
+    if status == STATUS_VERIFIED:
+        progress.verified.append(model_id)
+    elif status == STATUS_FAILED:
+        progress.failed.append(model_id)
+    elif status == STATUS_SKIPPED:
+        progress.skipped.append(model_id)
+    else:
+        progress.partial.append(model_id)
+    if not quiet:
+        print(f"  {note}")
 
 
 def verify_models(
@@ -824,7 +922,7 @@ def verify_models(
 
         # Step 0: Skip formats with no HF loader path (GGUF / MLX / FP4 / FP8).
         if is_incompatible_quantized(model_id):
-            _skip_model(model_id, arch, QUANTIZED_NOTE, progress, quiet)
+            _skip_model(model_id, arch, QUANTIZED_NOTE, progress, quiet, phases=phases)
             continue
 
         # Step 0a: skip HF-loadable quantized models when their loader lib is missing.
@@ -834,7 +932,7 @@ def verify_models(
 
             if importlib.util.find_spec(required_lib) is None:
                 note = f"Skipped: {required_lib} not installed (required to load this quantized format)"
-                _skip_model(model_id, arch, note, progress, quiet)
+                _skip_model(model_id, arch, note, progress, quiet, phases=phases)
                 continue
 
         # Step 0b: Check adapter-level phase applicability. Architectures
@@ -855,7 +953,7 @@ def verify_models(
                 f"verify_models coverage is deferred. Verification lives "
                 f"in integration tests."
             )
-            _skip_model(model_id, arch, note, progress, quiet)
+            _skip_model(model_id, arch, note, progress, quiet, phases=phases)
             continue
 
         # Step 1: Estimate parameters
@@ -865,7 +963,14 @@ def verify_models(
             if not quiet:
                 print(f"  Estimated parameters: {n_params:,}")
         except Exception as e:
-            _skip_model(model_id, arch, f"Config unavailable: {str(e)[:200]}", progress, quiet)
+            _skip_model(
+                model_id,
+                arch,
+                f"Config unavailable: {str(e)[:200]}",
+                progress,
+                quiet,
+                phases=phases,
+            )
             continue
 
         # Step 2: Check memory
@@ -880,7 +985,7 @@ def verify_models(
 
         if estimated_mem > max_memory_gb:
             note = f"Estimated {estimated_mem:.1f} GB exceeds {max_memory_gb:.1f} GB limit"
-            _skip_model(model_id, arch, note, progress, quiet)
+            _skip_model(model_id, arch, note, progress, quiet, phases=phases)
             continue
 
         # Step 3: Run benchmarks (all phases in a single call to share models)
@@ -918,210 +1023,13 @@ def verify_models(
                 scoring_tokenizer=_scoring_tokenizer,
             )
         except Exception as e:
-            error_msg = str(e)
+            error_msg = str(e) or type(e).__name__
             if not quiet:
                 print(f"  Benchmark failed: {error_msg[:200]}")
 
-        phase_scores = _extract_phase_scores(all_results)
-
-        if not error_msg:
-            score_error = _check_phase_scores(phase_scores, all_results)
-            if score_error:
-                error_msg = score_error
-
-        if error_msg:
-            is_oom = "out of memory" in error_msg.lower() or "oom" in error_msg.lower()
-            if is_oom:
-                note = "OOM during benchmark"
-            else:
-                # Include the specific error from failed results (e.g., tokenizer
-                # errors, load failures) so the note explains WHY it failed.
-                root_errors = [r.message for r in all_results if not r.passed and r.message]
-                if root_errors:
-                    # Deduplicate and use first unique error as the detail
-                    unique_errors = list(dict.fromkeys(root_errors))
-                    detail = unique_errors[0][:150]
-                    note = f"{error_msg[:100]} — {detail}"
-                else:
-                    note = error_msg[:200]
-            final_status = STATUS_FAILED
-        else:
-            note = _build_verified_note(phase_scores, all_results)
-            final_status = STATUS_VERIFIED
-
-        # When running a partial phase set (e.g., --phases 4 for backfill),
-        # only update the phase scores that were run.  Don't change the
-        # model's overall status or note — those reflect the full
-        # verification and should only be set by a complete run.
-        is_multimodal = classify_architecture(arch) == "multimodal"
-        is_audio = classify_architecture(arch) == "audio"
-        if is_audio:
-            full_phases = {1, 8}
-            core_required = {1, 8}
-        elif is_multimodal:
-            full_phases = {1, 2, 3, 4, 7}
-            core_required = {1, 4, 7}
-        else:
-            full_phases = {1, 2, 3, 4}
-            core_required = {1, 4}
-        is_partial_run = set(phases) != full_phases
-
-        if is_partial_run and phase_scores:
-            # Only write scores for phases that were actually requested.
-            # Bridge load failures can produce Phase 1-tagged error results
-            # even during Phase 4-only runs — don't let those corrupt
-            # existing scores for unrequested phases.
-            filtered_scores = {p: s for p, s in phase_scores.items() if p in phases}
-            if filtered_scores:
-                if not quiet:
-                    score_parts = [f"P{p}={s}%" for p, s in sorted(filtered_scores.items())]
-                    print(f"  Partial phase update: {', '.join(score_parts)}")
-
-                # Core verification: P1+P4 for text-only, P1+P4+P7 for multimodal.
-                is_core_verification = set(phases) >= core_required
-                partial_status = None
-                partial_note = None
-
-                if is_core_verification:
-                    p1 = filtered_scores.get(1)
-                    p4 = filtered_scores.get(4)
-                    p1_pass = p1 is not None and p1 >= _MIN_PHASE_SCORES.get(
-                        1, _DEFAULT_MIN_PHASE_SCORE
-                    )
-                    p4_pass = p4 is not None and p4 >= _MIN_PHASE_SCORES.get(
-                        4, _DEFAULT_MIN_PHASE_SCORE
-                    )
-
-                    # For multimodal, Phase 7 is required.  A score below 75%
-                    # or a missing score (NULL — processor unavailable) both
-                    # count as failures.
-                    p7_pass = True
-                    if is_multimodal:
-                        p7 = filtered_scores.get(7)
-                        if p7 is not None:
-                            p7_pass = p7 >= _MIN_PHASE_SCORES.get(7, _DEFAULT_MIN_PHASE_SCORE)
-                        else:
-                            p7_pass = False
-
-                    # For audio models, Phase 8 is required; Phase 4 is not applicable
-                    p8_pass = True
-                    if is_audio:
-                        p4_pass = True  # Audio models skip text quality
-                        p8 = filtered_scores.get(8)
-                        if p8 is not None:
-                            p8_pass = p8 >= _MIN_PHASE_SCORES.get(8, _DEFAULT_MIN_PHASE_SCORE)
-                        else:
-                            p8_pass = False
-
-                    if p1_pass and p4_pass and p7_pass and p8_pass:
-                        partial_status = STATUS_VERIFIED
-                        partial_note = "Core verification completed"
-                    elif p1_pass and p4_pass and not p7_pass:
-                        p7_score = filtered_scores.get(7)
-                        if p7_score is None:
-                            partial_status = STATUS_FAILED
-                            partial_note = (
-                                "Core verification failed: multimodal tests skipped "
-                                "(processor unavailable)"
-                            )
-                        else:
-                            partial_status = STATUS_FAILED
-                            partial_note = (
-                                f"Core verification failed: multimodal tests "
-                                f"scored {p7_score}% (requires >= 75%)"
-                            )
-                    elif p1_pass:
-                        partial_status = STATUS_VERIFIED
-                        partial_note = (
-                            "Core verification passed, but text quality poor. Needs review"
-                        )
-                    else:
-                        # P1 failed — build a descriptive failure note
-                        partial_status = STATUS_FAILED
-                        if error_msg:
-                            partial_note = f"CORE FAILED: {error_msg[:200]}"
-                        else:
-                            # Score-based failure — include details
-                            from transformer_lens.benchmarks.utils import (
-                                BenchmarkSeverity,
-                            )
-
-                            failed_tests = [
-                                r.name
-                                for r in all_results
-                                if r.phase == 1
-                                and not r.passed
-                                and r.severity != BenchmarkSeverity.SKIPPED
-                            ]
-                            tests_str = ", ".join(failed_tests) if failed_tests else "unknown"
-                            partial_note = f"CORE FAILED: P1={p1}% (failed: {tests_str})"
-
-                    if not quiet:
-                        print(f"  {partial_note}")
-
-                update_model_status(
-                    model_id,
-                    arch,
-                    status=partial_status,
-                    phase_scores=filtered_scores,
-                    note=partial_note,
-                )
-                if partial_status == STATUS_FAILED:
-                    progress.failed.append(model_id)
-                else:
-                    progress.verified.append(model_id)
-            else:
-                if not quiet:
-                    print(f"  No results for requested phases {phases} — skipping update")
-                progress.skipped.append(model_id)
-        elif final_status == STATUS_VERIFIED:
-            if not quiet:
-                print(
-                    f"  VERIFIED: P1={phase_scores.get(1)}%, "
-                    f"P2={phase_scores.get(2)}%, P3={phase_scores.get(3)}%, "
-                    f"P4={phase_scores.get(4)}%, P7={phase_scores.get(7)}%, "
-                    f"P8={phase_scores.get(8)}%"
-                )
-            update_model_status(
-                model_id,
-                arch,
-                STATUS_VERIFIED,
-                phase_scores=phase_scores,
-                note=note,
-            )
-            add_verification_record(
-                model_id,
-                arch,
-                notes=note,
-                status=STATUS_VERIFIED,
-            )
-            progress.verified.append(model_id)
-        else:
-            if not quiet:
-                print(f"  FAILED: {note}")
-                if any(v is not None for v in phase_scores.values()):
-                    print(
-                        f"  Partial scores saved: P1={phase_scores.get(1)}%, "
-                        f"P2={phase_scores.get(2)}%, P3={phase_scores.get(3)}%, "
-                        f"P4={phase_scores.get(4)}%, P7={phase_scores.get(7)}%, "
-                        f"P8={phase_scores.get(8)}%"
-                    )
-            update_model_status(
-                model_id,
-                arch,
-                STATUS_FAILED,
-                note=note,
-                phase_scores=phase_scores,
-                sanitize_fn=_sanitize_note,
-            )
-            add_verification_record(
-                model_id,
-                arch,
-                notes=note,
-                status=STATUS_FAILED,
-                sanitize_fn=_sanitize_note,
-            )
-            progress.failed.append(model_id)
+        _record_verification_result(
+            model_id, arch, phases, all_results, error_msg, progress, quiet
+        )
 
         # Post-model cleanup
         gc.collect()
@@ -1217,6 +1125,7 @@ def _print_summary(progress: VerificationProgress) -> None:
     print(f"  Verified:      {len(progress.verified)}")
     print(f"  Skipped:       {len(progress.skipped)}")
     print(f"  Failed:        {len(progress.failed)}")
+    print(f"  Partial:       {len(progress.partial)}")
 
     if progress.verified:
         print(f"\n  Verified models:")

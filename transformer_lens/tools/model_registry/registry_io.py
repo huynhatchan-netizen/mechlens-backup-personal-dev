@@ -293,6 +293,7 @@ def add_verification_record(
     sanitize_fn: Optional[Callable[[Optional[str]], Optional[str]]] = None,
     *,
     status: Optional[int] = None,
+    phases: Optional[list[int]] = None,
 ) -> None:
     """Append a VerificationRecord to verification_history.json.
 
@@ -302,7 +303,8 @@ def add_verification_record(
     Args:
         model_id: The verified model
         arch_id: Architecture type
-        status: Explicit outcome (0-3), or None when unknown
+        status: Explicit attempt outcome (0-3), or None when unknown
+        phases: Requested phases, including ones that may not have completed
         notes: Optional verification notes
         verified_by: Who/what performed the verification
         sanitize_fn: Optional callable to sanitize note strings
@@ -318,6 +320,7 @@ def add_verification_record(
         transformerlens_version=_get_tl_version(),
         notes=notes,
         status=status,
+        phases=list(phases) if phases is not None else None,
     )
 
     if _VERIFICATION_HISTORY_PATH.exists():
