@@ -22,8 +22,7 @@ class VerificationRecord:
         notes: Optional notes about the verification
         invalidated: Whether this verification has been invalidated
         invalidation_reason: Reason for invalidation if applicable
-        status: Registry outcome (0-3), or None for score-only updates. Legacy records default to 1.
-        phase_scores: Scores observed in this run, keyed by phase number
+        status: Explicit registry outcome (0-3), or None when unknown
     """
 
     model_id: str
@@ -34,12 +33,11 @@ class VerificationRecord:
     notes: Optional[str] = None
     invalidated: bool = False
     invalidation_reason: Optional[str] = None
-    status: Optional[int] = 1
-    phase_scores: dict[int, Optional[float]] = field(default_factory=dict)
+    status: Optional[int] = None
 
     def to_dict(self) -> dict:
         """Convert to a JSON-serializable dictionary."""
-        return {
+        data: dict = {
             "model_id": self.model_id,
             "architecture_id": self.architecture_id,
             "verified_date": self.verified_date.isoformat(),
@@ -48,9 +46,10 @@ class VerificationRecord:
             "notes": self.notes,
             "invalidated": self.invalidated,
             "invalidation_reason": self.invalidation_reason,
-            "status": self.status,
-            "phase_scores": {str(k): v for k, v in self.phase_scores.items()},
         }
+        if self.status is not None:
+            data["status"] = self.status
+        return data
 
     @classmethod
     def from_dict(cls, data: dict) -> "VerificationRecord":
@@ -64,8 +63,7 @@ class VerificationRecord:
             notes=data.get("notes"),
             invalidated=data.get("invalidated", False),
             invalidation_reason=data.get("invalidation_reason"),
-            status=data.get("status", 1),
-            phase_scores={int(k): v for k, v in data.get("phase_scores", {}).items()},
+            status=data.get("status"),
         )
 
 
@@ -99,7 +97,7 @@ class VerificationHistory:
             last_updated=last_updated,
         )
 
-    def get_record(self, model_id: str, architecture_id: Optional[str] = None) -> Optional[VerificationRecord]:
+    def get_record(self, model_id: str) -> Optional[VerificationRecord]:
         """Get the most recent valid verification record for a model.
 
         Args:
@@ -109,32 +107,26 @@ class VerificationHistory:
             The verification record, or None if not found or invalidated
         """
         for record in reversed(self.records):
-            if (
-                record.model_id == model_id
-                and (architecture_id is None or record.architecture_id == architecture_id)
-                and not record.invalidated
-            ):
+            if record.model_id == model_id and not record.invalidated:
                 return record
         return None
 
     def is_verified(self, model_id: str, architecture_id: Optional[str] = None) -> bool:
-        """Check if a model has a valid verification.
+        """Return whether the latest matching attempt explicitly succeeded.
 
-        Args:
-            model_id: The model ID to check
-
-        Returns:
-            True if the model has a valid (non-invalidated) verification
+        Legacy records without status are unknown, not evidence of success.
+        False therefore does not necessarily mean the model failed. Use the
+        registry API for the current registry status. Records are ordered by
+        insertion; an invalidated or unknown latest attempt never resurrects
+        an older success. Supplying architecture_id limits the lookup to that
+        architecture; omitting it retains model-ID-only matching.
         """
-        # Score-only runs do not change the last explicit outcome. Invalidation
-        # must not resurrect an older success.
         for record in reversed(self.records):
             if record.model_id != model_id:
                 continue
             if architecture_id is not None and record.architecture_id != architecture_id:
                 continue
-            if record.status is not None:
-                return record.status == 1 and not record.invalidated
+            return record.status == 1 and not record.invalidated
         return False
 
     def add_record(self, record: VerificationRecord) -> None:
@@ -146,9 +138,7 @@ class VerificationHistory:
         self.records.append(record)
         self.last_updated = datetime.now()
 
-    def invalidate(
-        self, model_id: str, reason: str, architecture_id: Optional[str] = None
-    ) -> bool:
+    def invalidate(self, model_id: str, reason: str) -> bool:
         """Invalidate the most recent verification for a model.
 
         Args:
@@ -158,7 +148,7 @@ class VerificationHistory:
         Returns:
             True if a record was invalidated, False if not found
         """
-        record = self.get_record(model_id, architecture_id)
+        record = self.get_record(model_id)
         if record:
             record.invalidated = True
             record.invalidation_reason = reason

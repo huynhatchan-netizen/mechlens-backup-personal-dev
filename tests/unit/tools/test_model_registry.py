@@ -283,6 +283,7 @@ class TestVerificationHistory:
 
         record = VerificationRecord(
             model_id="gpt2",
+            status=1,
             architecture_id="GPT2LMHeadModel",
             verified_date=date(2026, 1, 1),
         )

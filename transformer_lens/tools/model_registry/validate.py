@@ -395,20 +395,8 @@ def _validate_verification_record(data: dict, path: str) -> list[ValidationError
         errors.extend(_validate_string(data["notes"], f"{path}.notes", required=False))
 
     status = data.get("status")
-    if status is not None:
-        if type(status) is not int or status not in (0, 1, 2, 3):
-            errors.append(ValidationError(f"{path}.status", "expected status 0-3 or null", status))
-    scores = data.get("phase_scores", {})
-    if not isinstance(scores, dict):
-        errors.append(ValidationError(f"{path}.phase_scores", "expected object", scores))
-    else:
-        for phase, score in scores.items():
-            if phase not in ("1", "2", "3", "4", "7", "8"):
-                errors.append(ValidationError(f"{path}.phase_scores", "unknown phase", phase))
-            if score is not None and (type(score) not in (int, float) or not 0 <= score <= 100):
-                errors.append(
-                    ValidationError(f"{path}.phase_scores.{phase}", "expected 0-100 or null", score)
-                )
+    if status is not None and (type(status) is not int or status not in (0, 1, 2, 3)):
+        errors.append(ValidationError(f"{path}.status", "expected status 0-3 or null", status))
 
     # invalidated (optional boolean, defaults to False)
     if "invalidated" in data:

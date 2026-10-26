@@ -7,7 +7,7 @@ VerificationRecord/VerificationHistory dataclasses.
 
 import json
 import logging
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -292,19 +292,17 @@ def add_verification_record(
     verified_by: str = "verify_models",
     sanitize_fn: Optional[Callable[[Optional[str]], Optional[str]]] = None,
     *,
-    status: Optional[int] = STATUS_VERIFIED,
-    phase_scores: Optional[dict[int, Optional[float]]] = None,
+    status: Optional[int] = None,
 ) -> None:
     """Append a VerificationRecord to verification_history.json.
 
-    Uses the VerificationRecord dataclass properly instead of raw dict
-    manipulation.
+    Serialize only the new record; preserve existing records and unknown
+    metadata exactly as JSON values rather than normalizing them through dataclasses.
 
     Args:
         model_id: The verified model
         arch_id: Architecture type
-        status: Explicit outcome, or None for a score-only run
-        phase_scores: Scores from this run
+        status: Explicit outcome (0-3), or None when unknown
         notes: Optional verification notes
         verified_by: Who/what performed the verification
         sanitize_fn: Optional callable to sanitize note strings
@@ -320,9 +318,15 @@ def add_verification_record(
         transformerlens_version=_get_tl_version(),
         notes=notes,
         status=status,
-        phase_scores=dict(phase_scores or {}),
     )
 
-    history = load_verification_history()
-    history.add_record(record)
-    save_verification_history(history)
+    if _VERIFICATION_HISTORY_PATH.exists():
+        with open(_VERIFICATION_HISTORY_PATH) as f:
+            data = json.load(f)
+    else:
+        data = {"records": []}
+    data.setdefault("records", []).append(record.to_dict())
+    data["last_updated"] = datetime.now().isoformat()
+    with open(_VERIFICATION_HISTORY_PATH, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
